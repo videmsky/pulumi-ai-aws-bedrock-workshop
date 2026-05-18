@@ -1,5 +1,6 @@
 ---
 ---
+
 # Module 2: Hosting an MCP server behind an AgentCore Gateway
 
 **Duration:** ~45 minutes
@@ -411,6 +412,92 @@ current_region = aws.get_region_output()
 
 `config.requireSecret("testPassword")` marks the value as a Pulumi secret. Pulumi encrypts it in the state file and masks it in terminal output. The password never appears in plaintext in logs or `pulumi stack output`.
 
+### Content-hash helper for source fingerprinting
+
+Every downstream resource that depends on the MCP server source — the CodeBuild trigger, the AgentCore runtime's `SOURCE_VERSION` env var, the gateway target — needs to know when the source changed so it re-runs. A natural choice is `agentSourceObject.versionId` / `agent_source_object.version_id` from the `BucketObjectv2`, but it has a sharp edge: when the bucket and the first upload happen in the same `pulumi up`, S3 may not have versioning fully active in time, and the object's `versionId` comes back empty (or as the literal string `"null"` after a refresh). From then on, every later edit to the source still re-uploads, but `versionId` stays empty and the trigger chain silently no-ops — `pulumi up` reports no changes, your new tool never reaches the runtime, and you waste an afternoon debugging.
+
+Instead, we compute a stable SHA256 of the `mcp-server-code/` directory in Pulumi itself and use that as the fingerprint. Identical bytes ⇒ identical hash ⇒ no rebuild. Any byte-level change ⇒ new hash ⇒ full cascade fires.
+
+<div class="lang-tabs" markdown="1">
+
+<div class="lang-tab" data-lang="typescript" markdown="1">
+
+```typescript
+/**
+ * Return a deterministic SHA256 hex digest of every file under `directory`.
+ *
+ * Walks the tree in sorted order so the hash is stable across runs and
+ * machines. Used to fingerprint the MCP server source so downstream rebuild
+ * triggers fire whenever any file changes — independent of S3 object
+ * versionId, which is unreliable when bucket versioning was enabled after
+ * the first upload.
+ */
+function computeSourceHash(directory: string): string {
+  const hasher = createHash("sha256");
+  const walk = (dir: string) => {
+    const entries = fs
+      .readdirSync(dir, { withFileTypes: true })
+      .sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      const rel = path.relative(directory, full);
+      hasher.update(rel);
+      hasher.update("\0");
+      if (entry.isDirectory()) {
+        walk(full);
+      } else {
+        hasher.update(fs.readFileSync(full));
+        hasher.update("\0");
+      }
+    }
+  };
+  walk(directory);
+  return hasher.digest("hex");
+}
+
+const mcpServerCodeDir = path.resolve(__dirname, "mcp-server-code");
+const mcpServerSourceHash = computeSourceHash(mcpServerCodeDir);
+```
+
+</div>
+
+<div class="lang-tab" data-lang="python" markdown="1">
+
+```python
+def compute_source_hash(directory: str) -> str:
+    """Return a deterministic SHA256 hex digest of every file under `directory`.
+
+    Walks the tree in sorted order so the hash is stable across runs and
+    machines. Used to fingerprint the MCP server source so downstream rebuild
+    triggers fire whenever any file changes — independent of S3 object
+    versionId, which is unreliable when bucket versioning was enabled after
+    the first upload.
+    """
+    hasher = hashlib.sha256()
+    for root, dirs, files in os.walk(directory):
+        dirs.sort()
+        for name in sorted(files):
+            file_path = os.path.join(root, name)
+            rel = os.path.relpath(file_path, directory)
+            hasher.update(rel.encode("utf-8"))
+            hasher.update(b"\0")
+            with open(file_path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(65536), b""):
+                    hasher.update(chunk)
+            hasher.update(b"\0")
+    return hasher.hexdigest()
+
+
+mcp_server_code_dir = os.path.join(os.path.dirname(__file__), "mcp-server-code")
+mcp_server_source_hash = compute_source_hash(mcp_server_code_dir)
+```
+
+</div>
+
+</div>
+
+The walk is sorted by both directory and file name so the hash is reproducible across machines and across runs. Each file's relative path is mixed into the hash before its contents, so renames are detected even if the bytes are identical.
+
 ### S3 bucket for MCP server source code
 
 The server code gets zipped and uploaded to S3 so CodeBuild can read it.
@@ -452,9 +539,8 @@ new aws.s3.BucketVersioning("agent_source", {
 const agentSourceObject = new aws.s3.BucketObjectv2("agent_source", {
   bucket: agentSourceBucket.id,
   key: "mcp-server-code.zip",
-  source: new pulumi.asset.FileArchive(
-    path.resolve(__dirname, "mcp-server-code"),
-  ),
+  source: new pulumi.asset.FileArchive(mcpServerCodeDir),
+  sourceHash: mcpServerSourceHash,
   tags: {
     Name: "mcp-server-source-code",
   },
@@ -495,9 +581,8 @@ agent_source_object = aws.s3.BucketObjectv2(
     "agent_source",
     bucket=agent_source_bucket.id,
     key="mcp-server-code.zip",
-    source=pulumi.FileArchive(
-        os.path.join(os.path.dirname(__file__), "mcp-server-code")
-    ),
+    source=pulumi.FileArchive(mcp_server_code_dir),
+    source_hash=mcp_server_source_hash,
     tags={"Name": "mcp-server-source-code"},
 )
 ```
@@ -506,7 +591,7 @@ agent_source_object = aws.s3.BucketObjectv2(
 
 </div>
 
-The `FileArchive` automatically zips the `mcp-server-code/` directory. Versioning is enabled so Pulumi can detect when the source changes and trigger a rebuild.
+The `FileArchive` automatically zips the `mcp-server-code/` directory. The explicit `sourceHash` tells Pulumi exactly when the contents have changed — it doesn't have to rely on S3's `versionId`, which can be empty or unreliable in some edge cases (see the helper above). Bucket versioning is still enabled as defense-in-depth for retention/rollback, but it's not what gates rebuilds.
 
 ### Cognito User Pool
 
@@ -1809,7 +1894,7 @@ const triggerBuild = new aws.lambda.Invocation(
     functionName: buildTriggerFunction.name,
     input: buildTriggerInvocationInput,
     triggers: {
-      sourceVersion: agentSourceObject.versionId,
+      sourceVersion: mcpServerSourceHash,
       imageTag,
       buildspecSha256: buildspecFingerprint,
     },
@@ -1849,7 +1934,7 @@ trigger_build = aws.lambda_.Invocation(
     function_name=build_trigger_function.name,
     input=build_trigger_invocation_input,
     triggers={
-        "sourceVersion": agent_source_object.version_id,
+        "sourceVersion": mcp_server_source_hash,
         "imageTag": image_tag,
         "buildspecSha256": buildspec_fingerprint,
     },
@@ -1870,7 +1955,7 @@ trigger_build = aws.lambda_.Invocation(
 
 </div>
 
-The `triggers` map controls when the build re-runs. If the source code version, image tag, or buildspec changes, Pulumi triggers a new build. The `dependsOn` list includes `serverEcr` / `server_ecr` to ensure the repository exists before the build tries to push.
+The `triggers` map controls when the build re-runs. If the source content hash, image tag, or buildspec changes, Pulumi triggers a new build. The `dependsOn` list includes `serverEcr` / `server_ecr` to ensure the repository exists before the build tries to push.
 
 ### MCP server runtime
 
@@ -1888,7 +1973,7 @@ The runtime is similar to Module 1, with one addition: `protocolConfiguration` d
 ```typescript
 const runtimeName = `${stackName}_${agentName}`.replace(/-/g, "_");
 
-const sourceHash = agentSourceObject.versionId.apply((v) => v ?? "initial");
+const sourceHash = mcpServerSourceHash;
 
 const mergedEnvVars: Record<string, string> = {
   AWS_REGION: awsRegion,
@@ -1919,11 +2004,7 @@ const mcpServer = new aws.bedrock.AgentcoreAgentRuntime(
     },
   },
   {
-    dependsOn: [
-      triggerBuild,
-      agentExecutionRolePolicy,
-      agentExecutionManaged,
-    ],
+    dependsOn: [triggerBuild, agentExecutionRolePolicy, agentExecutionManaged],
   },
 );
 ```
@@ -1935,7 +2016,7 @@ const mcpServer = new aws.bedrock.AgentcoreAgentRuntime(
 ```python
 runtime_name = f"{stack_name}_{agent_name}".replace("-", "_")
 
-source_hash = agent_source_object.version_id.apply(lambda v: v if v else "initial")
+source_hash = mcp_server_source_hash
 
 merged_env_vars = {
     "AWS_REGION": aws_region,
@@ -2210,6 +2291,8 @@ def reverse_string(text: str) -> str:
 ```
 
 Redeploy with `pulumi up`, get a fresh token, and call your new tool with the test script. MCP auto-discovers tools, so the client picks it up without any config changes.
+
+Because we fingerprint the source directory with a content hash, a byte-level edit to `mcp_server.py` is sufficient — the next `pulumi up` recomputes the hash, re-uploads to S3, kicks off CodeBuild, and rolls out a new runtime version. No need to bump a config value, use `--target-replace`, or otherwise force a rebuild. If you ever see "no changes" from `pulumi up` after editing the source, that's a strong signal something is broken in the trigger chain — start with `pulumi preview --diff` to see what Pulumi thinks the state is.
 
 **Break the auth on purpose.** Grab a token, wait for it to expire (1 hour), and try again. Or tamper with the token by changing a character in the middle. See what error AgentCore returns. Understanding the failure modes helps when debugging real deployments.
 

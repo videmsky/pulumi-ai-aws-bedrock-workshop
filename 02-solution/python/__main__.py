@@ -5,6 +5,39 @@ import os
 import pulumi
 import pulumi_aws as aws
 
+
+# ============================================================================
+# Content-Hash Source Fingerprint
+# ============================================================================
+
+
+def compute_source_hash(directory: str) -> str:
+    """Return a deterministic SHA256 hex digest of every file under `directory`.
+
+    Walks the tree in sorted order so the hash is stable across runs and
+    machines. Used to fingerprint the MCP server source so downstream rebuild
+    triggers fire whenever any file changes — independent of S3 object
+    versionId, which is unreliable when bucket versioning was enabled after
+    the first upload.
+    """
+    hasher = hashlib.sha256()
+    for root, dirs, files in os.walk(directory):
+        dirs.sort()
+        for name in sorted(files):
+            file_path = os.path.join(root, name)
+            rel = os.path.relpath(file_path, directory)
+            hasher.update(rel.encode("utf-8"))
+            hasher.update(b"\0")
+            with open(file_path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(65536), b""):
+                    hasher.update(chunk)
+            hasher.update(b"\0")
+    return hasher.hexdigest()
+
+
+mcp_server_code_dir = os.path.join(os.path.dirname(__file__), "mcp-server-code")
+mcp_server_source_hash = compute_source_hash(mcp_server_code_dir)
+
 # ============================================================================
 # Configuration
 # ============================================================================
@@ -14,10 +47,7 @@ agent_name = config.get("agentName") or "MCPServerAgent"
 network_mode = config.get("networkMode") or "PUBLIC"
 image_tag = config.get("imageTag") or "latest"
 stack_name = config.get("stackName") or "agentcore-mcp-server"
-description = (
-    config.get("description")
-    or "MCP server runtime with JWT authentication"
-)
+description = config.get("description") or "MCP server runtime with JWT authentication"
 environment_variables = config.get_object("environmentVariables") or {}
 ecr_repository_name = config.get("ecrRepositoryName") or "mcp-server"
 test_user_name = config.get("testUsername") or "testuser"
@@ -70,9 +100,8 @@ agent_source_object = aws.s3.BucketObjectv2(
     "agent_source",
     bucket=agent_source_bucket.id,
     key="mcp-server-code.zip",
-    source=pulumi.FileArchive(
-        os.path.join(os.path.dirname(__file__), "mcp-server-code")
-    ),
+    source=pulumi.FileArchive(mcp_server_code_dir),
+    source_hash=mcp_server_source_hash,
     tags={"Name": "mcp-server-source-code"},
 )
 
@@ -197,9 +226,7 @@ cognito_password_setter_function = aws.lambda_.Function(
 set_cognito_password = aws.lambda_.Invocation(
     "set_cognito_password",
     function_name=cognito_password_setter_function.name,
-    input=pulumi.Output.all(
-        mcp_user_pool.id, current_region, test_user_password
-    ).apply(
+    input=pulumi.Output.all(mcp_user_pool.id, current_region, test_user_password).apply(
         lambda args: json.dumps(
             {
                 "userPoolId": args[0],
@@ -303,7 +330,9 @@ agent_execution = aws.iam.Role(
                             "aws:SourceArn": pulumi.Output.all(
                                 current_region, current_identity
                             ).apply(
-                                lambda args: f"arn:aws:bedrock-agentcore:{args[0].region}:{args[1].account_id}:*"
+                                lambda args: (
+                                    f"arn:aws:bedrock-agentcore:{args[0].region}:{args[1].account_id}:*"
+                                )
                             ),
                         },
                     },
@@ -360,7 +389,9 @@ agent_execution_role_policy = aws.iam.RolePolicy(
                     "Resource": pulumi.Output.all(
                         current_region, current_identity
                     ).apply(
-                        lambda args: f"arn:aws:logs:{args[0].region}:{args[1].account_id}:log-group:/aws/bedrock-agentcore/runtimes/*"
+                        lambda args: (
+                            f"arn:aws:logs:{args[0].region}:{args[1].account_id}:log-group:/aws/bedrock-agentcore/runtimes/*"
+                        )
                     ),
                 },
                 {
@@ -402,10 +433,14 @@ agent_execution_role_policy = aws.iam.RolePolicy(
                     ],
                     "Resource": [
                         pulumi.Output.all(current_region, current_identity).apply(
-                            lambda args: f"arn:aws:bedrock-agentcore:{args[0].region}:{args[1].account_id}:workload-identity-directory/default"
+                            lambda args: (
+                                f"arn:aws:bedrock-agentcore:{args[0].region}:{args[1].account_id}:workload-identity-directory/default"
+                            )
                         ),
                         pulumi.Output.all(current_region, current_identity).apply(
-                            lambda args: f"arn:aws:bedrock-agentcore:{args[0].region}:{args[1].account_id}:workload-identity-directory/default/workload-identity/*"
+                            lambda args: (
+                                f"arn:aws:bedrock-agentcore:{args[0].region}:{args[1].account_id}:workload-identity-directory/default/workload-identity/*"
+                            )
                         ),
                     ],
                 },
@@ -460,7 +495,9 @@ codebuild_role_policy = aws.iam.RolePolicy(
                     "Resource": pulumi.Output.all(
                         current_region, current_identity
                     ).apply(
-                        lambda args: f"arn:aws:logs:{args[0].region}:{args[1].account_id}:log-group:/aws/codebuild/*"
+                        lambda args: (
+                            f"arn:aws:logs:{args[0].region}:{args[1].account_id}:log-group:/aws/codebuild/*"
+                        )
                     ),
                 },
                 {
@@ -482,9 +519,7 @@ codebuild_role_policy = aws.iam.RolePolicy(
                     "Sid": "S3SourceAccess",
                     "Effect": "Allow",
                     "Action": ["s3:GetObject", "s3:GetObjectVersion"],
-                    "Resource": pulumi.Output.concat(
-                        agent_source_bucket.arn, "/*"
-                    ),
+                    "Resource": pulumi.Output.concat(agent_source_bucket.arn, "/*"),
                 },
                 {
                     "Sid": "S3BucketAccess",
@@ -642,7 +677,7 @@ trigger_build = aws.lambda_.Invocation(
     function_name=build_trigger_function.name,
     input=build_trigger_invocation_input,
     triggers={
-        "sourceVersion": agent_source_object.version_id,
+        "sourceVersion": mcp_server_source_hash,
         "imageTag": image_tag,
         "buildspecSha256": buildspec_fingerprint,
     },
@@ -664,7 +699,7 @@ trigger_build = aws.lambda_.Invocation(
 
 runtime_name = f"{stack_name}_{agent_name}".replace("-", "_")
 
-source_hash = agent_source_object.version_id.apply(lambda v: v if v else "initial")
+source_hash = mcp_server_source_hash
 
 merged_env_vars = {
     "AWS_REGION": aws_region,
@@ -713,10 +748,10 @@ mcp_gateway = aws.bedrock.AgentcoreGateway(
     authorizer_configuration={
         "custom_jwt_authorizer": {
             "allowed_clients": [mcp_client.id],
-            "discovery_url": pulumi.Output.all(
-                current_region, mcp_user_pool.id
-            ).apply(
-                lambda args: f"https://cognito-idp.{args[0].region}.amazonaws.com/{args[1]}/.well-known/openid-configuration"
+            "discovery_url": pulumi.Output.all(current_region, mcp_user_pool.id).apply(
+                lambda args: (
+                    f"https://cognito-idp.{args[0].region}.amazonaws.com/{args[1]}/.well-known/openid-configuration"
+                )
             ),
         }
     },
@@ -747,7 +782,9 @@ pulumi.export("cognitoUserPoolClientId", mcp_client.id)
 pulumi.export(
     "cognitoDiscoveryUrl",
     pulumi.Output.all(current_region, mcp_user_pool.id).apply(
-        lambda args: f"https://cognito-idp.{args[0].region}.amazonaws.com/{args[1]}/.well-known/openid-configuration"
+        lambda args: (
+            f"https://cognito-idp.{args[0].region}.amazonaws.com/{args[1]}/.well-known/openid-configuration"
+        )
     ),
 )
 pulumi.export("testUsername", test_user_name)
@@ -755,7 +792,9 @@ pulumi.export("testPassword", test_user_password)
 pulumi.export(
     "getTokenCommand",
     pulumi.Output.all(mcp_client.id, current_region, test_user_password).apply(
-        lambda args: f"python get_token.py {args[0]} {test_user_name} '{args[2]}' {args[1].region}"
+        lambda args: (
+            f"python get_token.py {args[0]} {test_user_name} '{args[2]}' {args[1].region}"
+        )
     ),
 )
 pulumi.export("gatewayId", mcp_gateway.gateway_id)

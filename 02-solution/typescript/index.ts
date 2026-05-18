@@ -33,6 +33,45 @@ const currentIdentity = aws.getCallerIdentityOutput({});
 const currentRegion = aws.getRegionOutput({});
 
 // ============================================================================
+// Content-Hash Source Fingerprint
+// ============================================================================
+
+/**
+ * Return a deterministic SHA256 hex digest of every file under `directory`.
+ *
+ * Walks the tree in sorted order so the hash is stable across runs and
+ * machines. Used to fingerprint the MCP server source so downstream rebuild
+ * triggers fire whenever any file changes — independent of S3 object
+ * versionId, which is unreliable when bucket versioning was enabled after
+ * the first upload.
+ */
+function computeSourceHash(directory: string): string {
+  const hasher = createHash("sha256");
+  const walk = (dir: string) => {
+    const entries = fs
+      .readdirSync(dir, { withFileTypes: true })
+      .sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      const rel = path.relative(directory, full);
+      hasher.update(rel);
+      hasher.update("\0");
+      if (entry.isDirectory()) {
+        walk(full);
+      } else {
+        hasher.update(fs.readFileSync(full));
+        hasher.update("\0");
+      }
+    }
+  };
+  walk(directory);
+  return hasher.digest("hex");
+}
+
+const mcpServerCodeDir = path.resolve(__dirname, "mcp-server-code");
+const mcpServerSourceHash = computeSourceHash(mcpServerCodeDir);
+
+// ============================================================================
 // S3 Bucket for MCP Server Source Code
 // ============================================================================
 
@@ -67,9 +106,8 @@ new aws.s3.BucketVersioning("agent_source", {
 const agentSourceObject = new aws.s3.BucketObjectv2("agent_source", {
   bucket: agentSourceBucket.id,
   key: "mcp-server-code.zip",
-  source: new pulumi.asset.FileArchive(
-    path.resolve(__dirname, "mcp-server-code"),
-  ),
+  source: new pulumi.asset.FileArchive(mcpServerCodeDir),
+  sourceHash: mcpServerSourceHash,
   tags: {
     Name: "mcp-server-source-code",
   },
@@ -646,7 +684,7 @@ const triggerBuild = new aws.lambda.Invocation(
     functionName: buildTriggerFunction.name,
     input: buildTriggerInvocationInput,
     triggers: {
-      sourceVersion: agentSourceObject.versionId,
+      sourceVersion: mcpServerSourceHash,
       imageTag,
       buildspecSha256: buildspecFingerprint,
     },
@@ -669,7 +707,7 @@ const triggerBuild = new aws.lambda.Invocation(
 
 const runtimeName = `${stackName}_${agentName}`.replace(/-/g, "_");
 
-const sourceHash = agentSourceObject.versionId.apply((v) => v ?? "initial");
+const sourceHash = mcpServerSourceHash;
 
 const mergedEnvVars: Record<string, string> = {
   AWS_REGION: awsRegion,
@@ -700,11 +738,7 @@ const mcpServer = new aws.bedrock.AgentcoreAgentRuntime(
     },
   },
   {
-    dependsOn: [
-      triggerBuild,
-      agentExecutionRolePolicy,
-      agentExecutionManaged,
-    ],
+    dependsOn: [triggerBuild, agentExecutionRolePolicy, agentExecutionManaged],
   },
 );
 
